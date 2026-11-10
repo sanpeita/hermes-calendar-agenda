@@ -1,0 +1,16 @@
+manifest_version: 1
+name: calendar-agenda
+label: Google Calendar Agenda
+kind: standalone
+version: 0.1.0
+author: sanpeita
+license: MIT
+description: Read-only Hermes Desktop agenda pane plus agent tools for recording event outcome and slot-retention state.
+requires_hermes: ">=0.21.5"  # Floor is the oldest Hermes whose plugin surface this
+# code targets. Keep it truthful: some builds report a baked base version lower
+# than the actual checkout, so do not raise the floor past what the code needs.
+provides_tools:
+  - calendar_agenda_list_today
+  - calendar_agenda_set_state
+provides_hooks: []
+requires_env: []

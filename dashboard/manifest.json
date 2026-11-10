@@ -1,0 +1,7 @@
+{
+  "manifest_version": 1,
+  "name": "calendar-agenda",
+  "label": "Google Calendar Agenda",
+  "version": "0.1.0",
+  "api": "plugin_api.py"
+}
