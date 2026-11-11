@@ -1,31 +1,24 @@
 """Google Calendar reads and two-axis agenda state updates.
 
+Credentials never live in this plugin. Every call goes through Hermes'
+``credentialed_provider_request`` using the OAuth client this plugin declares
+under ``oauth:`` in ``plugin.yaml`` (``hermes auth add calendar-agenda:google``).
+The plugin never reads, refreshes or rewrites a token file, and never imports
+another component's helper script.
+
 State is stored only in each event's private extended properties. The standard
 Google Calendar event status and visible event title are never repurposed.
 """
 
 from __future__ import annotations
 
-import hashlib
-import importlib.util
 import json
 import logging
-import sys
-import threading
 from datetime import date, datetime, time, timedelta
-from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
-from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-
-# This installed plugin belongs to this home, not to whichever request last
-# changed the host's active profile. Never use default-profile credentials.
-_PROFILE_HOME = Path(__file__).resolve().parents[2]
-_HELPER_MODULE_NAME = "hermes_calendar_agenda_google_api_" + hashlib.sha256(
-    str(_PROFILE_HOME).encode("utf-8")
-).hexdigest()[:16]
-_HELPER_LOCK = threading.RLock()
 logger = logging.getLogger(__name__)
 
 TIME_ZONE_NAME = "Asia/Tokyo"
@@ -37,82 +30,142 @@ UPDATED_AT_KEY = "hermesAgendaUpdatedAt"
 ORIGINAL_END_KEY = "hermesAgendaOriginalEnd"
 VALID_OUTCOMES = frozenset({"done", "interrupted", "cancelled", "skipped"})
 
-
-def _google_api_module():
-    """Load the owning profile's helper under a thread-local home override."""
-    with _HELPER_LOCK:
-        loaded = sys.modules.get(_HELPER_MODULE_NAME)
-        if loaded is not None:
-            return loaded
-
-        script = (
-            _PROFILE_HOME / "skills" / "productivity" / "google-workspace"
-            / "scripts" / "google_api.py"
-        )
-        if not script.is_file():
-            raise RuntimeError("Google Workspace skill script is not installed for this Hermes profile")
-
-        spec = importlib.util.spec_from_file_location(_HELPER_MODULE_NAME, script)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("Could not load the Google Workspace API helper")
-        module = importlib.util.module_from_spec(spec)
-        token = set_hermes_home_override(_PROFILE_HOME)
-        sys.modules[_HELPER_MODULE_NAME] = module
-        try:
-            spec.loader.exec_module(module)
-        except (Exception, SystemExit):
-            sys.modules.pop(_HELPER_MODULE_NAME, None)
-            raise
-        finally:
-            reset_hermes_home_override(token)
-        return module
-
-
-# googleapiclient's build_http() bakes DEFAULT_HTTP_TIMEOUT_SEC = 60 into the
-# httplib2 transport and nothing else in this path sets a timeout, so one stalled
-# socket held a /today request for a full minute before the pane got a 503
-# (observed as "Calendar Agenda read failed (TimeoutError)"). The plugin owns its
-# request budget, so clamp the transport and retry once instead.
-SERVICE_TIMEOUT_SECONDS = 20
+# The oauth: entry declared in plugin.yaml. Hermes attaches the token; this
+# plugin only ever names the client id.
+PROVIDER_ID = "google"
+CALENDAR_BASE_URL = "https://www.googleapis.com/calendar/v3"
+EVENTS_PATH = "/calendars/{calendar_id}/events"
+REQUEST_TIMEOUT_SECONDS = 20
 FETCH_ATTEMPTS = 2
-_SERVICE_LOCK = threading.RLock()
-_SERVICE_CACHE: dict[str, Any] = {}
 
 
-def _clamp_transport_timeout(service: Any) -> None:
-    """Best-effort clamp of the built client's socket timeout.
+class CalendarAPIError(RuntimeError):
+    """A Calendar REST call returned a non-2xx status."""
 
-    httplib2 reads ``.timeout`` per request (``sock.settimeout(self.timeout)``), so
-    setting it after ``build_service()`` sticks. A fixture service with no transport
-    (the offline profile-isolation tests return a Path) is left untouched.
+    def __init__(self, status: int, detail: str):
+        self.status = status
+        self.detail = detail
+        super().__init__(f"Google Calendar returned HTTP {status}: {detail}")
+
+
+class ProviderSignedOut(RuntimeError):
+    """No usable sign-in for the plugin's oauth client in this profile."""
+
+
+def _detail(response: Any) -> str:
+    text = getattr(response, "text", "") or ""
+    text = " ".join(str(text).split())
+    return text[:300] if text else "(no body)"
+
+
+def _default_request_fn(provider: str, method: str, url: str, **kwargs: Any) -> Any:
+    """Hand the request to Hermes, which attaches the sign-in itself.
+
+    Imported lazily so the module still imports (and the tests still run) outside
+    a Hermes process that has the plugin-provider surface.
     """
-    transport = getattr(service, "_http", None)
-    http = getattr(transport, "http", transport)
-    if http is not None and hasattr(http, "timeout"):
-        try:
-            http.timeout = SERVICE_TIMEOUT_SECONDS
-        except Exception:  # a read-only transport must not break the read path
-            logger.debug("Calendar Agenda: could not clamp the transport timeout", exc_info=True)
+    from hermes_cli.plugin_provider_requests import (
+        ProviderNotSignedIn,
+        credentialed_provider_request,
+    )
+
+    try:
+        return credentialed_provider_request(provider, method, url, **kwargs)
+    except ProviderNotSignedIn as exc:
+        raise ProviderSignedOut(
+            "Calendar Agenda is not signed in. Run `hermes auth add calendar-agenda:google` "
+            "in your own terminal."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - re-raised detached below
+        if isinstance(exc, TimeoutError) or type(exc).__name__.endswith("TimeoutException"):
+            raise TimeoutError(str(exc)) from None
+        raise
 
 
-def _calendar_service(*, fresh: bool = False):
-    """The profile's Calendar client, built once per process.
+class CalendarClient:
+    """Minimal Calendar v3 REST client whose only credential is Hermes' grant."""
 
-    Caching keeps one transport (and its connection pool) for the process instead of
-    a fresh client per request; ``fresh=True`` discards it so a retry after a timeout
-    does not reuse a connection the stall poisoned.
-    """
-    with _SERVICE_LOCK:
-        if fresh:
-            _SERVICE_CACHE.pop("calendar", None)
-        cached = _SERVICE_CACHE.get("calendar")
-        if cached is not None:
-            return cached
-        service = _google_api_module().build_service("calendar", "v3")
-        _clamp_transport_timeout(service)
-        _SERVICE_CACHE["calendar"] = service
-        return service
+    def __init__(
+        self,
+        *,
+        provider: str = PROVIDER_ID,
+        base_url: str = CALENDAR_BASE_URL,
+        calendar_id: str = CALENDAR_ID,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
+        request_fn: Callable[..., Any] | None = None,
+    ) -> None:
+        self.provider = provider
+        self.base_url = base_url.rstrip("/")
+        self.calendar_id = calendar_id
+        self.timeout = timeout
+        self._request_fn = request_fn or _default_request_fn
 
+    # -- transport -------------------------------------------------------
+    def _url(self, path: str, params: dict[str, Any] | None) -> str:
+        url = f"{self.base_url}{path}"
+        clean = {key: value for key, value in (params or {}).items() if value is not None}
+        return f"{url}?{urlencode(clean)}" if clean else url
+
+    def _call(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        url = self._url(path, params)
+        response = self._request_fn(
+            self.provider, method, url, json=body, headers=headers, timeout=self.timeout
+        )
+        if getattr(response, "status", 0) >= 400:
+            raise CalendarAPIError(int(response.status), _detail(response))
+        return response
+
+    def _event_path(self) -> str:
+        return EVENTS_PATH.format(calendar_id=quote(self.calendar_id, safe=""))
+
+    def _event_url(self, event_id: str) -> str:
+        return f"{self._event_path()}/{quote(str(event_id), safe='')}"
+
+    # -- Calendar v3 surface ---------------------------------------------
+    def list_events(self, *, time_min: str, time_max: str, page_token: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "maxResults": 2500,
+            "singleEvents": "true",
+            "orderBy": "startTime",
+            "maxAttendees": 200,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        return self._call("GET", self._event_path(), params=params).json()
+
+    def get_event(self, event_id: str) -> dict[str, Any]:
+        return self._call("GET", self._event_url(event_id)).json()
+
+    def patch_event(
+        self,
+        event_id: str,
+        body: dict[str, Any],
+        *,
+        etag: str | None = None,
+        send_updates: str = "none",
+    ) -> dict[str, Any]:
+        headers = {"Content-Type": "application/json"}
+        if etag:
+            headers["If-Match"] = etag
+        params = {"sendUpdates": send_updates} if send_updates else None
+        return self._call(
+            "PATCH", self._event_url(event_id), params=params, body=body, headers=headers
+        ).json()
+
+
+# ---------------------------------------------------------------------------
+# Event projection helpers
+# ---------------------------------------------------------------------------
 
 def _parse_event_datetime(value: dict[str, Any]) -> datetime | None:
     raw = value.get("dateTime")
@@ -179,16 +232,7 @@ def _fetch_agenda(api: Any, today: date, start: datetime, end: datetime) -> dict
     events: list[dict[str, Any]] = []
     page_token = None
     while True:
-        response = api.events().list(
-            calendarId=CALENDAR_ID,
-            timeMin=_rfc3339(start),
-            timeMax=_rfc3339(end),
-            maxResults=2500,
-            singleEvents=True,
-            orderBy="startTime",
-            maxAttendees=200,
-            **({"pageToken": page_token} if page_token else {}),
-        ).execute()
+        response = api.list_events(time_min=_rfc3339(start), time_max=_rfc3339(end), page_token=page_token)
         events.extend(
             _event_for_display(event)
             for event in response.get("items", [])
@@ -201,12 +245,12 @@ def _fetch_agenda(api: Any, today: date, start: datetime, end: datetime) -> dict
     return {"date": today.isoformat(), "timeZone": TIME_ZONE_NAME, "events": events}
 
 
-def list_today_events(*, now: datetime | None = None, service=None) -> dict[str, Any]:
+def list_today_events(*, now: datetime | None = None, api: Any = None) -> dict[str, Any]:
     """Return today's primary-calendar agenda, bounded by Asia/Tokyo midnight.
 
-    A caller-supplied ``service`` is used as-is. Otherwise the process-wide client is
-    used and a single TimeoutError is retried on a freshly built one, so a stalled
-    connection costs one short attempt instead of surfacing a 503 to the agenda pane.
+    A caller-supplied ``api`` is used as-is. Otherwise a fresh client is used and one
+    TimeoutError is retried once, so a stalled request costs one short attempt
+    instead of surfacing a 503 to the agenda pane.
     """
     current = now or datetime.now(TIME_ZONE)
     if current.tzinfo is None:
@@ -215,21 +259,27 @@ def list_today_events(*, now: datetime | None = None, service=None) -> dict[str,
     start = datetime.combine(today, time.min, tzinfo=TIME_ZONE)
     end = datetime.combine(today + timedelta(days=1), time.min, tzinfo=TIME_ZONE)
 
-    if service is not None:
-        return _fetch_agenda(service, today, start, end)
+    if api is not None:
+        return _fetch_agenda(api, today, start, end)
 
     last: TimeoutError | None = None
+    client = _client()
     for attempt in range(FETCH_ATTEMPTS):
         try:
-            return _fetch_agenda(_calendar_service(fresh=attempt > 0), today, start, end)
+            return _fetch_agenda(client, today, start, end)
         except TimeoutError as exc:
             last = exc
             logger.warning(
                 "Calendar Agenda read timed out (attempt %d/%d, %ss budget)",
-                attempt + 1, FETCH_ATTEMPTS, SERVICE_TIMEOUT_SECONDS,
+                attempt + 1, FETCH_ATTEMPTS, REQUEST_TIMEOUT_SECONDS,
             )
+            client = _client()  # a fresh attempt, not one sharing the stalled state
     assert last is not None
     raise last
+
+
+def _client() -> CalendarClient:
+    return CalendarClient()
 
 
 def _parse_actual_end(value: str | None, fallback: datetime) -> datetime:
@@ -244,12 +294,6 @@ def _parse_actual_end(value: str | None, fallback: datetime) -> datetime:
     return parsed
 
 
-def _set_if_match(request, etag: str | None) -> None:
-    headers = getattr(request, "headers", None)
-    if etag and isinstance(headers, dict):
-        headers["If-Match"] = etag
-
-
 def set_event_state(
     event_id: str,
     outcome: str,
@@ -257,7 +301,7 @@ def set_event_state(
     *,
     actual_end: str | None = None,
     now: datetime | None = None,
-    service=None,
+    api: Any = None,
 ) -> dict[str, Any]:
     """Record the independent outcome/slot axes and make the approved time adjustment.
 
@@ -273,8 +317,8 @@ def set_event_state(
     if type(keep_slot) is not bool:
         raise ValueError("keep_slot must be a boolean")
 
-    api = service or _calendar_service()
-    event = api.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    client = api or _client()
+    event = client.get_event(event_id)
     if event.get("status") == "cancelled":
         raise ValueError("Cancelled Google Calendar events cannot receive agenda state")
 
@@ -338,16 +382,9 @@ def set_event_state(
     if new_end is not None:
         body["end"] = new_end
 
-    request = api.events().patch(
-        calendarId=CALENDAR_ID,
-        eventId=event_id,
-        body=body,
-        sendUpdates="none",
-    )
-    _set_if_match(request, event.get("etag"))
-    request.execute()
+    client.patch_event(event_id, body, etag=event.get("etag"))
 
-    verified = api.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    verified = client.get_event(event_id)
     verified_private = _private_properties(verified)
     if verified_private.get(OUTCOME_KEY) != outcome or verified_private.get(KEEP_SLOT_KEY) != ("true" if keep_slot else "false"):
         raise RuntimeError("Calendar state update could not be verified")

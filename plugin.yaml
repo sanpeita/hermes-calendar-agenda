@@ -2,13 +2,27 @@ manifest_version: 1
 name: calendar-agenda
 label: Google Calendar Agenda
 kind: standalone
-version: 0.1.0
+version: 0.1.1
 author: sanpeita
 license: MIT
-description: Read-only Hermes Desktop agenda pane plus agent tools for recording event outcome and slot-retention state.
-requires_hermes: ">=0.21.5"  # Floor is the oldest Hermes whose plugin surface this
-# code targets. Keep it truthful: some builds report a baked base version lower
-# than the actual checkout, so do not raise the floor past what the code needs.
+description: Agent tools plus dashboard API routes for today's Google Calendar agenda and per-event outcome/slot state.
+requires_hermes: ">=0.22.3"  # oauth: entries and credentialed_provider_request first ship together in the v0.22.3 release tag.
+oauth:
+  - id: google
+    authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+    token_url: https://oauth2.googleapis.com/token
+    scopes:
+      - https://www.googleapis.com/auth/calendar.events
+    client_id_env: CALENDAR_AGENDA_GOOGLE_CLIENT_ID
+    client_secret_env: CALENDAR_AGENDA_GOOGLE_CLIENT_SECRET
+    authorize_params:
+      access_type: offline
+      prompt: consent
+    hosts:
+      - www.googleapis.com
+optional_env:
+  - CALENDAR_AGENDA_GOOGLE_CLIENT_ID
+  - CALENDAR_AGENDA_GOOGLE_CLIENT_SECRET
 provides_tools:
   - calendar_agenda_list_today
   - calendar_agenda_set_state

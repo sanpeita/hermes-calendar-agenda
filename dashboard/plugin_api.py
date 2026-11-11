@@ -1,4 +1,4 @@
-"""Read-only agenda endpoint for the Desktop pane plus explicit state updates."""
+"""Agenda API routes (backend only, no frontend) plus explicit state updates."""
 
 from __future__ import annotations
 

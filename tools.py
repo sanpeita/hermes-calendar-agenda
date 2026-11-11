@@ -71,7 +71,10 @@ def _handle_list_today(args: dict, **kwargs) -> str:
         return _json_result(list_today_events())
     except (Exception, SystemExit) as exc:
         logger.error("calendar_agenda_list_today failed (%s)", type(exc).__name__)
-        return _json_error(f"Could not read Google Calendar ({type(exc).__name__}). Check the Google Workspace connection for this Hermes profile.")
+        return _json_error(
+            f"Could not read Google Calendar ({type(exc).__name__}). "
+            "If this profile has never signed in, run `hermes auth add calendar-agenda:google`."
+        )
 
 
 def _handle_set_state(args: dict, **kwargs) -> str:

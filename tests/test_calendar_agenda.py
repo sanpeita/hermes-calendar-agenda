@@ -17,44 +17,25 @@ from calendar_agenda_service import (
 JST = ZoneInfo("Asia/Tokyo")
 
 
-class FakeRequest:
-    def __init__(self, action):
-        self.action = action
-        self.headers = {}
+class FakeAPI:
+    """The CalendarClient surface the service depends on, without any transport."""
 
-    def execute(self):
-        return self.action()
-
-
-class FakeEvents:
     def __init__(self, events):
         self.events_by_id = {event["id"]: copy.deepcopy(event) for event in events}
         self.list_args = None
-        self.last_patch = None
+        self.patches = []
 
-    def list(self, **kwargs):
-        self.list_args = kwargs
-        return FakeRequest(lambda: {"items": list(copy.deepcopy(self.events_by_id).values())})
+    def list_events(self, *, time_min, time_max, page_token=None):
+        self.list_args = {"timeMin": time_min, "timeMax": time_max, "pageToken": page_token}
+        return {"items": [copy.deepcopy(event) for event in self.events_by_id.values()]}
 
-    def get(self, *, calendarId, eventId):
-        return FakeRequest(lambda: copy.deepcopy(self.events_by_id[eventId]))
-
-    def patch(self, *, calendarId, eventId, body, sendUpdates):
-        request = FakeRequest(lambda: self._apply(eventId, body))
-        self.last_patch = {"request": request, "body": copy.deepcopy(body), "sendUpdates": sendUpdates}
-        return request
-
-    def _apply(self, event_id, body):
-        self.events_by_id[event_id].update(copy.deepcopy(body))
+    def get_event(self, event_id):
         return copy.deepcopy(self.events_by_id[event_id])
 
-
-class FakeService:
-    def __init__(self, events):
-        self.resource = FakeEvents(events)
-
-    def events(self):
-        return self.resource
+    def patch_event(self, event_id, body, *, etag=None, send_updates="none"):
+        self.patches.append({"body": copy.deepcopy(body), "etag": etag, "sendUpdates": send_updates})
+        self.events_by_id[event_id].update(copy.deepcopy(body))
+        return copy.deepcopy(self.events_by_id[event_id])
 
 
 def _personal_event():
@@ -74,21 +55,31 @@ class CalendarAgendaServiceTests(unittest.TestCase):
     def test_list_today_uses_tokyo_midnight_and_hides_cancelled_items(self):
         event = _personal_event()
         cancelled = dict(event, id="cancelled", status="cancelled")
-        service = FakeService([event, cancelled])
-        result = list_today_events(now=datetime(2026, 10, 9, 10, tzinfo=JST), service=service)
+        api = FakeAPI([event, cancelled])
+        result = list_today_events(now=datetime(2026, 10, 9, 10, tzinfo=JST), api=api)
 
         self.assertEqual(result["date"], "2026-10-09")
         self.assertEqual(result["timeZone"], "Asia/Tokyo")
         self.assertEqual([item["id"] for item in result["events"]], ["personal-1"])
-        self.assertEqual(service.resource.list_args["timeMin"], "2026-10-09T00:00:00+09:00")
-        self.assertEqual(service.resource.list_args["timeMax"], "2026-10-10T00:00:00+09:00")
+        self.assertEqual(api.list_args["timeMin"], "2026-10-09T00:00:00+09:00")
+        self.assertEqual(api.list_args["timeMax"], "2026-10-10T00:00:00+09:00")
+
+    def test_list_today_follows_page_tokens(self):
+        class PagedAPI(FakeAPI):
+            def list_events(self, *, time_min, time_max, page_token=None):
+                if page_token is None:
+                    return {"items": [dict(_personal_event(), id="a")], "nextPageToken": "p2"}
+                return {"items": [dict(_personal_event(), id="b")]}
+
+        result = list_today_events(now=datetime(2026, 10, 9, 10, tzinfo=JST), api=PagedAPI([]))
+        self.assertEqual([item["id"] for item in result["events"]], ["a", "b"])
 
     def test_personal_event_shortens_and_saves_exact_original_end(self):
         event = _personal_event()
-        service = FakeService([event])
+        api = FakeAPI([event])
         now = datetime(2026, 10, 9, 10, 15, tzinfo=JST)
-        result = set_event_state("personal-1", "done", False, now=now, service=service)
-        updated = service.resource.events_by_id["personal-1"]
+        result = set_event_state("personal-1", "done", False, now=now, api=api)
+        updated = api.events_by_id["personal-1"]
         private = updated["extendedProperties"]["private"]
 
         self.assertEqual(updated["end"]["dateTime"], "2026-10-09T10:15:00+09:00")
@@ -96,8 +87,9 @@ class CalendarAgendaServiceTests(unittest.TestCase):
         self.assertEqual(private[OUTCOME_KEY], "done")
         self.assertEqual(private[KEEP_SLOT_KEY], "false")
         self.assertEqual(updated["extendedProperties"]["shared"], {"otherShared": "keep-me-too"})
-        self.assertEqual(service.resource.last_patch["sendUpdates"], "none")
-        self.assertEqual(service.resource.last_patch["request"].headers["If-Match"], '"etag-1"')
+        self.assertEqual(api.patches[-1]["sendUpdates"], "none")
+        self.assertEqual(api.patches[-1]["etag"], '"etag-1"')
+        self.assertEqual(api.patches[-1]["body"]["end"]["dateTime"], "2026-10-09T10:15:00+09:00")
         self.assertTrue(result["verified"])
         self.assertTrue(result["calendarEndChanged"])
         self.assertTrue(result["originalEndSaved"])
@@ -105,16 +97,17 @@ class CalendarAgendaServiceTests(unittest.TestCase):
     def test_guest_event_only_changes_private_state(self):
         event = _personal_event()
         event["attendees"] = [{"email": "guest@example.test", "self": False}]
-        service = FakeService([event])
+        api = FakeAPI([event])
         result = set_event_state(
             "personal-1", "interrupted", False,
             now=datetime(2026, 10, 9, 10, 15, tzinfo=JST),
-            service=service,
+            api=api,
         )
 
-        updated = service.resource.events_by_id["personal-1"]
+        updated = api.events_by_id["personal-1"]
         self.assertEqual(updated["end"], event["end"])
         self.assertEqual(updated["extendedProperties"]["private"][OUTCOME_KEY], "interrupted")
+        self.assertNotIn("end", api.patches[-1]["body"])
         self.assertFalse(result["calendarEndChanged"])
         self.assertEqual(result["timeChangeReason"], "shared_or_not_owned")
 
@@ -126,26 +119,26 @@ class CalendarAgendaServiceTests(unittest.TestCase):
             ORIGINAL_END_KEY: json.dumps(original_end, separators=(",", ":")),
             KEEP_SLOT_KEY: "false",
         })
-        service = FakeService([event])
+        api = FakeAPI([event])
 
         result = set_event_state(
             "personal-1", "done", True,
             now=datetime(2026, 10, 9, 10, 30, tzinfo=JST),
-            service=service,
+            api=api,
         )
 
-        updated = service.resource.events_by_id["personal-1"]
+        updated = api.events_by_id["personal-1"]
         self.assertEqual(updated["end"], original_end)
         self.assertEqual(updated["extendedProperties"]["private"][KEEP_SLOT_KEY], "true")
         self.assertTrue(result["calendarEndChanged"])
 
     def test_naive_actual_end_is_rejected(self):
-        service = FakeService([_personal_event()])
+        api = FakeAPI([_personal_event()])
         with self.assertRaisesRegex(ValueError, "timezone"):
             set_event_state(
                 "personal-1", "done", False,
                 actual_end="2026-10-09T10:15:00",
-                service=service,
+                api=api,
             )
 
 

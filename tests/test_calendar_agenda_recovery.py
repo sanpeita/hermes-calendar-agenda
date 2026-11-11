@@ -62,12 +62,12 @@ class ExitIsolationTests(unittest.TestCase):
         with patch.object(self.api, "_service_module", return_value=types.SimpleNamespace(list_today_events=lambda: expected)):
             self.assertEqual(self.api.today(), expected)
 
-    def test_legacy_service_cache_is_not_reused(self):
+    def test_service_module_is_loaded_from_this_plugin_copy(self):
         stale = types.SimpleNamespace(list_today_events=lambda: {"wrong_profile": True})
         with patch.dict(sys.modules, {"hermes_calendar_agenda_service": stale}):
             service = self.api._service_module()
             self.assertIsNot(service, stale)
-            self.assertEqual(service._PROFILE_HOME, ROOT.parents[1])
+            self.assertEqual(Path(service.__file__).resolve(), (ROOT / "calendar_agenda_service.py").resolve())
 
 
 if __name__ == "__main__":

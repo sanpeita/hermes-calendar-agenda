@@ -1,6 +1,6 @@
 # Calendar Agenda
 
-**A Google Calendar agenda pane and outcome tracker for Hermes Agent.**
+**Agent tools and dashboard API routes for today's Google Calendar agenda, plus per-event outcome tracking, for Hermes Agent.**
 
 A calendar shows what was *planned*. It never records what actually *happened*.
 Calendar Agenda closes that gap: it gives Hermes a read-only view of today's
@@ -14,9 +14,10 @@ kept ("frozen") for later.
 
 ## What it does
 
-- **Agenda pane API** (`dashboard/plugin_api.py`) — `GET /today` returns
+- **Dashboard API routes** (`dashboard/plugin_api.py`) — `GET /today` returns
   today's events from the profile's primary Google Calendar, bounded by local
-  midnight, each annotated with its recorded Hermes state.
+  midnight, each annotated with its recorded Hermes state. The routes are the
+  backend; this plugin ships no Desktop pane or dashboard frontend of its own.
 - **Two agent tools**:
   - `calendar_agenda_list_today` — read today's agenda (IDs, titles, times,
     state). It deliberately does **not** return event descriptions or
@@ -45,27 +46,58 @@ finished. This is guarded, in code, by all of the following:
   property. Marking the slot as kept later **restores the original end**
   exactly. Releasing a slot twice can never extend it.
 - Writes are conditional (`If-Match` on the event etag), send no update
-  notifications (`sendUpdates="none"`), and are **verified by re-reading the
+  notifications (`sendUpdates=none`), and are **verified by re-reading the
   event** — a state update that cannot be verified raises an error instead of
   claiming success.
 - Failures (including a helper that tries to exit the process) are converted
-  into ordinary tool/HTTP errors; the agent and the pane keep running.
+  into ordinary tool/HTTP errors; the agent and the routes keep running.
 
-## Profile isolation
+## Authentication
 
-The plugin belongs to the Hermes profile it is installed in. It loads that
-profile's Google Workspace helper under a thread-local home override and
-refuses to fall back to another profile's credentials — a request can never
-be served with the wrong account's calendar.
+This plugin has **no token file** and does not depend on another skill. It
+declares its own Google OAuth client under `oauth:` in `plugin.yaml`, Hermes
+performs the sign-in, and every Calendar call is made through
+`credentialed_provider_request` with Hermes attaching the grant. Plugin code
+never sees, refreshes or rewrites a token.
+
+One-time setup, per Hermes profile:
+
+1. In the Google Cloud console, create (or pick) a project and enable the
+   **Google Calendar API**.
+2. Configure the OAuth consent screen (External) and add your own account as a
+   test user.
+3. Credentials → Create credentials → **OAuth client ID** → *Desktop app* →
+   copy the client ID and client secret.
+4. Export them for the profile Hermes runs as:
+
+   ```bash
+   CALENDAR_AGENDA_GOOGLE_CLIENT_ID=...
+   CALENDAR_AGENDA_GOOGLE_CLIENT_SECRET=...
+   ```
+
+5. Sign in from your own terminal (it opens a browser):
+
+   ```bash
+   hermes auth add calendar-agenda:google
+   hermes auth status calendar-agenda:google
+   ```
+
+Requested scope: `https://www.googleapis.com/auth/calendar.events`. Requests go
+to `www.googleapis.com` only. The grant is stored and refreshed by Hermes per
+profile — two profiles can therefore point at two different Google accounts —
+and is removed by `hermes auth logout calendar-agenda:google` or by uninstalling
+the plugin.
+
+The two variables are declared under `optional_env`, so the plugin still loads
+before you sign in; the tools then answer with a "not signed in" error naming
+the command above, instead of failing to load.
 
 ## Requirements
 
-- Hermes Agent **>= 0.21.5**
-- The **google-workspace skill** installed and authorized in the *same*
-  profile (the plugin uses that skill's `google_api.py` to build the Calendar
-  client with the profile's own Google authorization; the plugin itself never
-  reads token files or `.env` files)
-- For the dashboard pane API: the Hermes dashboard runtime (FastAPI /
+- Hermes Agent **>= 0.22.3** — the release in which `oauth:` manifest entries and
+  `credentialed_provider_request` first ship together
+- A Google Cloud OAuth client of your own (free)
+- For the dashboard API routes: the Hermes dashboard runtime (FastAPI /
   Pydantic, provided by Hermes)
 - No third-party Python dependencies of its own
 
@@ -120,8 +152,8 @@ Mounted by Hermes under `/api/plugins/calendar-agenda/`:
 
 ## Disclosure
 
-- **Network**: talks to the Google Calendar API only, through the profile's
-  own google-workspace authorization.
+- **Network**: `https://www.googleapis.com` (Calendar v3) only, with the grant
+  Hermes holds for `calendar-agenda:google`.
 - **Reads**: today's events on the primary calendar. The agent-facing list
   tool exposes IDs, titles and times only — not descriptions or locations.
 - **Writes**: private extended properties on events, plus guarded end-time
@@ -131,19 +163,18 @@ Mounted by Hermes under `/api/plugins/calendar-agenda/`:
 
 ## Tests
 
-16 offline unit tests (fake Calendar service; no network, no real account):
+23 offline unit tests (fake Calendar client; no network, no real account):
 
 ```bash
-# with Hermes's own modules (hermes_constants) importable, plus
-# fastapi + pydantic for the dashboard API tests
-python -m unittest discover -s tests
+PYTHONPATH=. python -m unittest discover -s tests -p "test_*.py"
 ```
 
-They cover: Tokyo-midnight windowing, shortening with exact original-end
-save/restore, guest events never being retimed, profile isolation (a
-profile can never fall back to another profile's Google credentials), and
-error isolation (a failing helper becomes a 503 / tool error, never a dead
-agent).
+They cover: Tokyo-midnight windowing and pagination, shortening with exact
+original-end save/restore, guest events never being retimed, the REST adapter
+(URL and query building, `If-Match`, `sendUpdates=none`, HTTP error and timeout
+mapping), a guard that the service never re-introduces a borrowed credential
+(`google_token` / `google_api` / `build_service`), and error isolation (a
+failing helper becomes a 503 / tool error, never a dead agent).
 
 ## License
 
